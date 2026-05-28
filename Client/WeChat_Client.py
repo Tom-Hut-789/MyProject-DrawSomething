@@ -11,7 +11,7 @@ from typing import Optional, Dict, List, Any, Callable
 # Constants
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SERVER_IP = '127.0.0.1'
-DEFAULT_SERVER_PORT = 80
+DEFAULT_SERVER_PORT = 5200
 BUFFER_SIZE = 4096
 
 class NetworkManager:

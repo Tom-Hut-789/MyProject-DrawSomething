@@ -7,7 +7,7 @@ from typing import Dict, List, Any, Optional, Tuple
 
 # Constants
 HOST = '0.0.0.0'
-PORT = 80
+PORT = 5200
 BUFFER_SIZE = 4096
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'usr_info.pickle')
