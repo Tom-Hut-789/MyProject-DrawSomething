@@ -3,408 +3,347 @@ import threading
 import pickle
 import struct
 import os
+from typing import Dict, List, Any, Optional, Tuple
 
-def get_host_ip():
-    """
-    查询本机局域网IP地址
-    """
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-    finally:
-        s.close()
-    return ip
-
-def get_public_ip():
-    """
-    查询本机公网IP地址
-    """
-    try:
-        import urllib.request
-        # 使用一个可靠的 API 获取公网 IP
-        return urllib.request.urlopen('http://ident.me', timeout=3).read().decode('utf8')
-    except:
-        return "无法获取（可能无公网访问权限或网络受限）"
-
-#监听物理网卡上的所有局域网/公网 IP
+# Constants
 HOST = '0.0.0.0'
 PORT = 80
 BUFFER_SIZE = 4096
-
-print(f"服务器正在启动...")
-print(f"========================================")
-print(f"1.1. 局域网连接请使用 IP: {get_host_ip()}")
-print(f"1.2. 跨局域网连接（需内网穿透/公网IP）请使用 IP: {get_public_ip()}")
-print(f"2. 端口: {PORT}")
-print(f"========================================")
-
-# 获取当前脚本所在目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'usr_info.pickle')
-# 全局数据
-conn_users = []
-conn_ad = {}
-conn_so = {}
-rooms = {}    # {房间名: {"host":"", "drawer": user, "word": "", "players": [socket列表]}}
-lock = threading.Lock()
 
-def load_users():
-    if os.path.exists(DB_PATH):
+class DrawServer:
+    """The main server for the DrawSomething game."""
+
+    def __init__(self, host: str = HOST, port: int = PORT):
+        self.host = host
+        self.port = port
+        self.server_socket: Optional[socket.socket] = None
+        
+        # State management
+        self.users_online: List[str] = []
+        self.user_sockets: Dict[str, socket.socket] = {}
+        self.user_addresses: Dict[str, Tuple[str, int]] = {}
+        self.rooms: Dict[str, Dict[str, Any]] = {} # {room_name: {host, drawer, word, players}}
+        
+        self.lock = threading.Lock()
+        self.db = self._load_db()
+
+    def _load_db(self) -> Dict[str, str]:
+        """Loads user credentials from the pickle database."""
+        if os.path.exists(DB_PATH):
+            try:
+                with open(DB_PATH, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                print(f"Database error: {e}")
+                return {}
+        return {}
+
+    def _save_db(self):
+        """Saves user credentials to the pickle database."""
+        with open(DB_PATH, 'wb') as f:
+            pickle.dump(self.db, f)
+
+    def _get_host_ip(self) -> str:
+        """Retrieves the local network IP address."""
         try:
-            with open(DB_PATH, 'rb') as f:
-                return pickle.load(f)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
         except:
-            # 如果文件为空或损坏
-            print(f"{DB_PATH}文件为空或损坏!")
-            return {}
-    return {}
+            return "127.0.0.1"
 
-def save_users(users):
-    with open(DB_PATH, 'wb') as f:
-        pickle.dump(users, f)
+    def send_data(self, conn: socket.socket, data: Dict[str, Any]):
+        """Sends serialized data to a client with packet framing."""
+        try:
+            data_bytes = pickle.dumps(data)
+            conn.sendall(struct.pack('i', len(data_bytes)) + data_bytes)
+        except Exception as e:
+            print(f"Send error: {e}")
 
-def send_data(conn, data):
-    """发送数据（解决粘包）"""
-    data_bytes = pickle.dumps(data)
-    conn.sendall(struct.pack('i', len(data_bytes)) + data_bytes)
-
-def recv_data(conn):
-    """接收数据（解决粘包）"""
-    data_len = struct.unpack('i', conn.recv(4))[0]
-    data = b''
-    while len(data) < data_len:
-        packet = conn.recv(min(data_len - len(data), BUFFER_SIZE))
-        if not packet:
+    def recv_data(self, conn: socket.socket) -> Optional[Dict[str, Any]]:
+        """Receives data from a client with packet framing."""
+        try:
+            header = conn.recv(4)
+            if not header:
+                return None
+            data_len = struct.unpack('i', header)[0]
+            data = b''
+            while len(data) < data_len:
+                packet = conn.recv(min(data_len - len(data), BUFFER_SIZE))
+                if not packet:
+                    return None
+                data += packet
+            return pickle.loads(data)
+        except Exception as e:
+            print(f"Receive error: {e}")
             return None
-        data += packet
-    return pickle.loads(data)
 
-def validate_logon(conn, ad):
-    authenticated = False
-    data = recv_data(conn)
-    print(f"接收到登录消息{data}")
-    cmd = data["cmd"]
-    this_username = data["username"]
-    password = data["password"]
-    users = load_users()
-    try:
-        if cmd == 'login':
-            if len(users)==0:
-                print("用户库中没有数据")
-            elif this_username not in users:
-                send_data(conn, {cmd:"fail_null"})
-                print(f"用户[{this_username}]不存在, 用户库[{users}]")
-            elif this_username in users and users[this_username] != password:
-                send_data(conn, {cmd:"fail_error"})
-                print(f"用户[{this_username}]密码错误")
-            elif this_username in users and users[this_username] == password:
-                authenticated = True
-        elif cmd == 'register':
-            if len(users)==0 or this_username not in users:
-                users[this_username] = password
-                save_users(users)
-                send_data(conn, {cmd:"success"})
-                print(f"用户[{this_username}]完成注册")
-            elif this_username in users:
-                send_data(conn, {cmd:"existed"})
-                print(f"用户[{this_username}]重名")
-    except Exception as e:
-        print(f"验证出错: {e}")
-        conn.close()
-        print(f"关闭socket")
-        return False,this_username
+    def handle_client(self, conn: socket.socket, addr: Tuple[str, int]):
+        """Main client thread handler."""
+        print(f"Connected by {addr}")
+        username = None
+        
+        try:
+            # Phase 1: Authentication
+            authenticated, username = self._authenticate(conn, addr)
+            if not authenticated:
+                conn.close()
+                return
 
-    if authenticated:
-        if this_username in conn_users:
-            send_data(conn, {cmd:"fail_online"})
-            conn.close()
-            print(f"用户[{this_username}]在线，不允许重复登录")
-            return False,this_username
-        else:
-            # 向客户端发送在线用户列表
-            send_data(conn, {cmd:"success","users_online":conn_users})
-            print(f"本用户[{this_username}]已成功验证登录")
-            # 转发
-            for item in conn_users:
-                send_data(conn_so[item],{"cmd":"online","user":this_username})
-            # 进入聊天阶段
-            conn_users.append(this_username)
-            conn_ad[this_username] = ad
-            conn_so[this_username] = conn
-            print(f"当前在线用户[{conn_users}]")
-            return True,this_username
-    else:
-        conn.close()
-        print(f"已关闭socket")
-        return False,this_username
-
-def tcp_task(conn, ad):
-    # 登录验证阶段
-    is_passed, this_username = validate_logon(conn, ad)
-    if not is_passed:
-        return
-
-    this_roomname = None
-    try:
-        while True:
-            data = recv_data(conn)
-            if not data:
-                break
-
-            cmd = data.get("cmd")
-            print(f"收到指令: {cmd}")
-            # 上线
-            if cmd == "online":
-                user1 = data.get("user")
-                # 接收
-                send_data(conn, {"cmd":cmd, "user":user1,"users_online": conn_users})
-            # 下线
-            elif cmd == "offline":
-                user1 = data.get("user")
-                if user1 == this_username:
-                    print(f"本用户{user1} has been offline!")
-                    # 转发
-                    conn_users.remove(this_username)
-                    conn_ad.pop(this_username)
-                    conn_so.pop(this_username)
-                    for item in conn_users:
-                        send_data(conn_so[item], {
-                            "cmd": cmd,
-                            "user":user1,
-                            "users_online": conn_users}) # 建议顺便把更新后的列表发过去
-                    print(f"当前在线用户：{conn_users}")
+            # Phase 2: Game loop
+            current_room = None
+            while True:
+                data = self.recv_data(conn)
+                if not data:
                     break
-                else:
-                    # 接收
-                    send_data(conn, {"cmd": cmd, "user": user1, "users_online": conn_users})
-            # 1. 聊天
-            elif cmd == "chat":
-                user_sender = data.get("user")
-                msg = data["msg"]
-                if user_sender == this_username:
-                    # 确认
-                    send_data(conn, {"cmd": cmd, "user":user_sender, "msg":msg})
-                    # 转发
-                    for item in conn_users:
-                        if item != this_username:
-                            send_data(conn_so[item],{"cmd":cmd, "user":user_sender, "msg":msg})
-                    print(f'已转发本用户[{user_sender}]的消息[{msg}]')
-                else:
-                    # 接收
-                    send_data(conn, {"cmd":cmd, "user": user_sender, "msg":msg})
-            # 2. 创建房间
-            elif cmd == "create_room":
-                room_name = data["room"]
-                user_name = data.get("user")
-                with lock:
-                    if user_name == this_username:
-                        if room_name not in rooms:
-                            # 创建
-                            rooms[room_name] = {
-                                "host": data["host"],
-                                "drawer": data["drawer"],
-                                "word": "",
-                                "players": data["players"]
-                            }
-                            # 确认
-                            send_data(conn, {"cmd":cmd, "user": user_name, "state":"success", "room":room_name})
-                            # 转发
-                            for item in conn_users:
-                                if item != user_name:
-                                    send_data(conn_so[item], {"cmd": cmd, "user": user_name, "room": room_name})
-                            this_roomname = room_name
-                            print(f'本用户[{user_name}]创建的房间[{room_name}], {rooms}')
-                        else:
-                            # 确认
-                            send_data(conn, {"cmd":cmd, "user": user_name, "state":"failure_existed", "room":room_name})
-                            print(f"用户[{user_name}] 创建房间[{room_name}]失败：房间已存在")
-                    else:
-                        # 接收
-                        send_data(conn, {"cmd": cmd, "user": user_name, "room": room_name})
-            # 3. 加入房间
-            elif cmd == "join_room":
-                room_name = data["room"]
-                user_name = data.get("user")
-                with lock:
-                    if user_name == this_username:
-                        if room_name in rooms:
-                            this_roomname = room_name
-                            # 发本用户
-                            send_data(conn, {
-                                "cmd":cmd,
-                                "user":this_username,
-                                "room":room_name,  # 补上 room 字段
-                                "state":"success",
-                                "host":rooms[room_name]["host"],
-                                "drawer":rooms[room_name]["drawer"],
-                                "players":rooms[room_name]["players"]
-                            })
-                            # 转发其他用户
-                            for item in rooms[room_name]["players"]:
-                                send_data(conn_so[item], {"cmd":cmd,"user":this_username, "room":room_name})
-                            rooms[room_name]["players"].append(this_username)
-                            print(f"本用户[{this_username}]加入了房间[{room_name}], {rooms}")
-                        else:
-                            # 发本用户
-                            send_data(conn, {"cmd":cmd, "user":this_username, "room":room_name,  "state":"failure_absent"})
-                            print(f"本用户[{this_username}]未能加入房间[{room_name}]：房间不存在")
-                    else:
-                        # 发本用户
-                        send_data(conn, {"cmd": cmd, "user": user_name, "room": room_name})
-                        print(f"用户[{user_name}]加入房间[{room_name}]")
-            # 5. 进入房间
-            if this_roomname:
-                if cmd == "guess":
-                    player1 = data.get("player")
-                    word1 = data.get("word")
-                    reply = ""
-                    answer = rooms[this_roomname]["word"]
-                    if player1 == this_username:
-                        if len(answer) == 0:
-                            # 确认
-                            send_data(conn, {"cmd": cmd, "player":player1, "reply": reply})
-                            print(f"绘画人[{player1}]未设置答案！")
-                        else:
-                            if word1 == answer:
-                                reply = "true"
-                            else:
-                                reply = "false"
-                            # 确认
-                            send_data(conn, {"cmd": cmd, "player":player1, "reply": reply})
-                            # 转发
-                            for item in rooms[this_roomname]["players"]:
-                                if item != player1:
-                                    send_data(conn_so[item], {
-                                        "cmd": cmd,
-                                        "player": this_username,
-                                        "reply": reply
-                                    })
-                            print(f"玩家[{player1}]的回答判断为[{reply}]")
-                    else:
-                        # 接收
-                        send_data(conn, {"cmd": cmd, "player":player1, "reply": reply})
-                elif cmd == 'image':
-                    player1 = data.get("player")
-                    image1 = data.get("image")
-                    if player1 == this_username:
-                        # 确认
-                        send_data(conn, {"cmd": cmd, "player": player1})
-                        # 转发
-                        if this_roomname and this_roomname in rooms:
-                            for item in rooms[this_roomname]["players"]:
-                                if item != player1:
-                                    send_data(conn_so[item], {"cmd": cmd, "player": player1, "image": image1})
-                            print(f'已转发来自玩家[{player1}] 的图片到房间[{this_roomname}]')
-                    else:
-                        # 接收
-                        send_data(conn, {"cmd": cmd, "player": player1, "image": image1})
-                elif cmd == "set_drawer":
-                    player1 = data.get("player")
-                    drawer1 = data["drawer"]
-                    room1 = data["room"]
-                    if player1 == this_username:
-                        rooms[this_roomname]["drawer"] = drawer1
-                        # 清除
-                        rooms[this_roomname]["word"] = ""
-                        # 确认
-                        send_data(conn, {"cmd": cmd, "player": player1, "drawer":drawer1, "room": room1})
-                        # 转发
-                        for item in rooms[this_roomname]["players"]:
-                            if item != this_username:
-                                send_data(conn_so[item], {"cmd":cmd, "player": player1, "drawer":drawer1, "room":room1})
-                        print(f"用户[{this_username}] 已设置用户[{drawer1}]为绘画人")
-                    else:
-                        # 接收
-                        send_data(conn, {"cmd": cmd, "player": player1, "drawer": drawer1, "room": room1})
-                elif cmd == "set_word":
-                    player1 = data.get("player")
-                    if player1 == this_username:
-                        word1 = data["word"]
-                        rooms[this_roomname]["word"] = word1
-                        # 确认
-                        send_data(conn, {"cmd":cmd, "player":player1, "word":word1})
-                        # 转发
-                        for item in rooms[this_roomname]["players"]:
-                            if item != this_username:
-                                send_data(conn_so[item], {"cmd": cmd, "player": player1})
-                        print(f"用户[{player1}] 已设置答案为[{word1}]")
-                    else:
-                        # 接收
-                        send_data(conn,{"cmd":cmd, "player":player1})
+                
+                cmd = data.get("cmd")
+                if not cmd: continue
+                
+                print(f"[{username}] Command: {cmd}")
+                
+                if cmd == "offline":
+                    break
+                
+                elif cmd == "chat":
+                    self._handle_chat(username, data)
+                
+                elif cmd == "create_room":
+                    current_room = self._handle_create_room(username, data, conn)
+                
+                elif cmd == "join_room":
+                    current_room = self._handle_join_room(username, data, conn)
+                
                 elif cmd == "exit_room":
-                    player1 = data.get("player")
-                    rooms[this_roomname]["players"].remove(player1)
-                    if player1 == this_username:
-                        # 转发
-                        if player1 == rooms[this_roomname]["host"]:
-                            for item in rooms[this_roomname]["players"]:
-                                send_data(conn_so[item], {
-                                    "cmd":"delete_room", "host":player1, "room":this_roomname
-                                })
-                            rooms.pop(this_roomname)
-                            print(f"发送出：房间{this_roomname} 已注销!")
-                        else:
-                            for item in rooms[this_roomname]["players"]:
-                                send_data(conn_so[item], {
-                                    "cmd":cmd, "player":player1, "room":this_roomname
-                                })
-                            print(f"发送出：本玩家[{player1}] has left!")
-                        this_roomname = None
+                    self._handle_exit_room(username, data)
+                    current_room = None
+                
+                elif cmd == "guess":
+                    self._handle_guess(username, data, current_room)
+                
+                elif cmd == "image":
+                    self._handle_image(username, data, current_room)
+                
+                elif cmd == "set_drawer":
+                    self._handle_set_drawer(username, data, current_room)
+                
+                elif cmd == "set_word":
+                    self._handle_set_word(username, data, current_room)
+
+        except Exception as e:
+            print(f"Client handler error for {username}: {e}")
+        finally:
+            self._cleanup_client(username, conn)
+
+    def _authenticate(self, conn: socket.socket, addr: Tuple[str, int]) -> Tuple[bool, Optional[str]]:
+        """Handles login and registration commands."""
+        while True:
+            data = self.recv_data(conn)
+            if not data: return False, None
+            
+            cmd = data.get("cmd")
+            u, p = data.get("username"), data.get("password")
+            
+            if cmd == "login":
+                with self.lock:
+                    if u not in self.db:
+                        self.send_data(conn, {"login": "fail_null"})
+                    elif self.db[u] != p:
+                        self.send_data(conn, {"login": "fail_error"})
+                    elif u in self.users_online:
+                        self.send_data(conn, {"login": "fail_online"})
                     else:
-                        # 接收
-                        send_data(conn, {"cmd":cmd,"player":player1,"room":this_roomname})
-                elif cmd == "delete_room":
-                    host1 = data.get("host")
-                    room1 = data.get("room")
-                    # 接收
-                    send_data(conn,{"cmd":cmd, "host":host1, "room":room1})
-                    print(f"接收到：房主[{host1}]注销了房间[{room1}]")
-    except Exception as e:
-        print(f"用户[{this_username}]的线程因通信错误而退出: {e}")
+                        # Success
+                        self.send_data(conn, {"login": "success", "users_online": self.users_online})
+                        # Notify others
+                        for other in self.users_online:
+                            self.send_data(self.user_sockets[other], {"cmd": "online", "user": u})
+                        
+                        self.users_online.append(u)
+                        self.user_sockets[u] = conn
+                        self.user_addresses[u] = addr
+                        return True, u
+            
+            elif cmd == "register":
+                with self.lock:
+                    if u in self.db:
+                        self.send_data(conn, {"register": "existed"})
+                    else:
+                        self.db[u] = p
+                        self._save_db()
+                        self.send_data(conn, {"register": "successful"})
+            else:
+                return False, None
 
-    finally:
-        # 断开连接清理
-        with lock:
-            if this_roomname in rooms:
-                if this_username in rooms[this_roomname]["players"]:
-                    rooms[this_roomname]["players"].remove(this_username)
-                if this_username == rooms[this_roomname]["host"]:
-                    for item in rooms[this_roomname]["players"]:
-                        send_data(conn_so[item], {
-                            "cmd": "delete_room", "host": this_username,"room":this_roomname })
-                    rooms.pop(this_roomname)
-                    print(f"无连接，房主[{this_username}]的房间[{this_roomname}] 已注销!")
-                else:
-                    for item in rooms[this_roomname]["players"]:
-                        send_data(conn_so[item], {
-                            "cmd":"exit_room", "player":this_username,"room":this_roomname })
-            if this_username in conn_users:
-                conn_users.remove(this_username)
-                conn_ad.pop(this_username)
-                conn_so.pop(this_username)
-                # 向客户端发送在线用户列表
-                for item in conn_users:
-                    send_data(conn_so[item], {
-                                "cmd": "offline",
-                                "user": this_username })
-        conn.close()
-        print(f"本用户[{this_username}]退出, 其他在线用户[{conn_users}]")
+    def _handle_chat(self, sender: str, data: Dict[str, Any]):
+        """Broadcasts chat messages to all online users."""
+        msg = data.get("msg")
+        with self.lock:
+            for user in self.users_online:
+                self.send_data(self.user_sockets[user], {"cmd": "chat", "user": sender, "msg": msg})
 
+    def _handle_create_room(self, creator: str, data: Dict[str, Any], conn: socket.socket) -> Optional[str]:
+        """Handles room creation."""
+        room_name = data.get("room")
+        with self.lock:
+            if room_name in self.rooms:
+                self.send_data(conn, {"cmd": "create_room", "user": creator, "state": "failure_existed", "room": room_name})
+                return None
+            
+            self.rooms[room_name] = {
+                "host": creator,
+                "drawer": creator,
+                "word": "",
+                "players": [creator]
+            }
+            self.send_data(conn, {"cmd": "create_room", "user": creator, "state": "success", "room": room_name})
+            # Notify lobby
+            for user in self.users_online:
+                if user != creator:
+                    self.send_data(self.user_sockets[user], {"cmd": "create_room", "user": creator, "room": room_name})
+            return room_name
 
-def start_server():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind((HOST, PORT))
-    s.listen(10)
-    # print(f"服务端开始运行，请在客户端输入IP和端口（{HOST}，{PORT}），等待客户端连接...")
-    print("=====服务端系统日志=====")
+    def _handle_join_room(self, player: str, data: Dict[str, Any], conn: socket.socket) -> Optional[str]:
+        """Handles room joining."""
+        room_name = data.get("room")
+        with self.lock:
+            if room_name not in self.rooms:
+                self.send_data(conn, {"cmd": "join_room", "user": player, "room": room_name, "state": "failure_absent"})
+                return None
+            
+            room = self.rooms[room_name]
+            self.send_data(conn, {
+                "cmd": "join_room", "user": player, "room": room_name, "state": "success",
+                "host": room["host"], "drawer": room["drawer"], "players": room["players"]
+            })
+            
+            # Notify room players
+            for other in room["players"]:
+                self.send_data(self.user_sockets[other], {"cmd": "join_room", "user": player, "room": room_name})
+            
+            room["players"].append(player)
+            return room_name
 
-    while True:
-        client_sock, client_add = s.accept()
-        print(f"接收到一个用户请求，地址[{client_add}]")
-        t = threading.Thread(target=tcp_task, args=(client_sock, client_add))
-        t.start()
-        print(f"已建立该用户的监听线程")
+    def _handle_exit_room(self, player: str, data: Dict[str, Any]):
+        """Handles room exiting."""
+        room_name = data.get("room")
+        with self.lock:
+            self._cleanup_room(player, room_name)
+
+    def _handle_guess(self, player: str, data: Dict[str, Any], room_name: str):
+        """Processes guesses in a room."""
+        if not room_name: return
+        guess = data.get("word")
+        with self.lock:
+            room = self.rooms.get(room_name)
+            if not room: return
+            
+            answer = room["word"]
+            if not answer:
+                self.send_data(self.user_sockets[player], {"cmd": "guess", "player": player, "reply": ""})
+                return
+            
+            reply = "true" if guess == answer else "false"
+            for user in room["players"]:
+                self.send_data(self.user_sockets[user], {"cmd": "guess", "player": player, "reply": reply})
+
+    def _handle_image(self, player: str, data: Dict[str, Any], room_name: str):
+        """Relays drawing images to room players."""
+        if not room_name: return
+        image_data = data.get("image")
+        with self.lock:
+            room = self.rooms.get(room_name)
+            if not room: return
+            for user in room["players"]:
+                self.send_data(self.user_sockets[user], {"cmd": "image", "player": player, "image": image_data})
+
+    def _handle_set_drawer(self, requester: str, data: Dict[str, Any], room_name: str):
+        """Updates the drawer in a room (host only)."""
+        if not room_name: return
+        new_drawer = data.get("drawer")
+        with self.lock:
+            room = self.rooms.get(room_name)
+            if not room or room["host"] != requester: return
+            
+            room["drawer"] = new_drawer
+            room["word"] = "" # Reset word for new drawer
+            for user in room["players"]:
+                self.send_data(self.user_sockets[user], {"cmd": "set_drawer", "player": requester, "drawer": new_drawer, "room": room_name})
+
+    def _handle_set_word(self, drawer: str, data: Dict[str, Any], room_name: str):
+        """Sets the word to be guessed (drawer only)."""
+        if not room_name: return
+        word = data.get("word")
+        with self.lock:
+            room = self.rooms.get(room_name)
+            if not room or room["drawer"] != drawer: return
+            
+            room["word"] = word
+            for user in room["players"]:
+                self.send_data(self.user_sockets[user], {"cmd": "set_word", "player": drawer, "word": word})
+
+    def _cleanup_room(self, player: str, room_name: str):
+        """Removes a player from a room and deletes the room if necessary."""
+        if room_name in self.rooms:
+            room = self.rooms[room_name]
+            if player in room["players"]:
+                room["players"].remove(player)
+            
+            if player == room["host"]:
+                # Notify all room players and delete room
+                for other in room["players"]:
+                    self.send_data(self.user_sockets[other], {"cmd": "delete_room", "host": player, "room": room_name})
+                self.rooms.pop(room_name)
+            else:
+                # Notify remaining players
+                for other in room["players"]:
+                    self.send_data(self.user_sockets[other], {"cmd": "exit_room", "player": player, "room": room_name})
+
+    def _cleanup_client(self, username: Optional[str], conn: socket.socket):
+        """Cleans up user state on disconnection."""
+        with self.lock:
+            if username in self.users_online:
+                # Remove from any rooms
+                rooms_to_cleanup = [rn for rn, r in self.rooms.items() if username in r["players"]]
+                for rn in rooms_to_cleanup:
+                    self._cleanup_room(username, rn)
+                
+                self.users_online.remove(username)
+                self.user_sockets.pop(username)
+                self.user_addresses.pop(username)
+                
+                # Notify others
+                for other in self.users_online:
+                    self.send_data(self.user_sockets[other], {"cmd": "offline", "user": username})
+            
+            conn.close()
+            if username:
+                print(f"User {username} disconnected.")
+
+    def start(self):
+        """Starts the server listener."""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(10)
+        
+        print(f"Server started on {self._get_host_ip()}:{self.port}")
+        print("Waiting for connections...")
+        
+        try:
+            while True:
+                client_sock, client_addr = self.server_socket.accept()
+                t = threading.Thread(target=self.handle_client, args=(client_sock, client_addr), daemon=True)
+                t.start()
+        except KeyboardInterrupt:
+            print("Server stopping...")
+        finally:
+            if self.server_socket:
+                self.server_socket.close()
 
 if __name__ == "__main__":
-    start_server()
+    server = DrawServer()
+    server.start()
